@@ -5,7 +5,7 @@ import sys
 
 
 # API配置 - 使用环境变量配置IndexTTS2服务器地址
-api_url = os.environ.get("INDEX_TTS2_SERVER", "http://127.0.0.1:8006/generate_tts")
+api_url = os.environ.get("INDEX_TTS2_SERVER", "http://127.0.0.1:19200/generate_tts")
 
 
 def indextts2_tts_url(source_wav, source_text,src_lang, src_duration,target_wav,target_text,target_lang,target_duration):
