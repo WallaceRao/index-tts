@@ -20,6 +20,10 @@ from typing import List, Optional
 from logger import logger
 import tempfile
 import torch
+from reference_backend import get_reference_audio
+from mos_client import score_audio
+from pydub import AudioSegment
+from io import BytesIO
 
 try:
     from vllm.v1.engine.exceptions import EngineDeadError
@@ -250,6 +254,15 @@ def get_text_bytes_len(text):
     return len(text.encode('utf-8'))
 
 
+def convert_wav_binary_to_mp3_binary(wav_binary):
+    audio = AudioSegment.from_file(BytesIO(wav_binary), format="wav",parameters=["-loglevel", "quiet"])
+    # 导出为 MP3 字节流
+    mp3_buffer = BytesIO()
+    audio.export(mp3_buffer, format="mp3", bitrate="128K")
+    return mp3_buffer.getvalue()
+
+
+
 @app.post("/generate_tts", responses={
     200: {"content": {"audio/wav": {}}},
     400: {"description": "Bad Request"},
@@ -294,6 +307,23 @@ async def generate_tts(
                     prompt_audio_temp_path = sv_ret['sim_wav']
                 else:
                     logger.error(f"get similar wav failed, prompt_audio:{prompt_audio_temp_path}, sv_ret:{sv_ret}")
+            else:
+                score = score_audio(prompt_audio_temp_path)
+                if score and score['OVRL'] < 2.2:
+                    logger.info(f"score_audio is less than 2.2, prompt_audio:{prompt_audio_temp_path}")
+                    reference_audio_bytes = await asyncio.to_thread(
+                        get_reference_audio, str(prompt_audio_temp_path)
+                    )
+                    if reference_audio_bytes:
+                        if prompt_audio_temp_path.endswith(".mp3"):
+                            reference_audio_bytes = convert_wav_binary_to_mp3_binary(reference_audio_bytes)
+                        with open(prompt_audio_temp_path, "wb") as f:
+                            f.write(reference_audio_bytes)
+                            f.flush()
+                            os.fsync(f.fileno())
+                    else:
+                        logger.error(f"get reference audio failed, prompt_audio:{prompt_audio_temp_path}")
+                        raise HTTPException(status_code=500, detail="TTS inference failed to generate any valid audio.")
         max_mos = -1
         best_audio_bytes = None
         tasks = []
@@ -342,6 +372,89 @@ async def generate_tts(
                 reserved = torch.cuda.memory_reserved() / 1024 ** 2
                 allocated = torch.cuda.memory_allocated() / 1024 ** 2
                 logger.info(f"After freeing GPU memory, reserved:{reserved}, allocated:{allocated}")
+
+
+
+
+@app.post("/generate_reference_audio", responses={
+    200: {"content": {"audio/wav": {}}},
+    400: {"description": "Bad Request"},
+    500: {"description": "Internal Server Error"}
+})
+async def generate_reference_audio(
+    prompt_audio: UploadFile = File(...),
+):
+    """
+    使用上传的音频作为音色参考，根据输入文本生成语音。
+    - **text**: 要转换为语音的文本。
+    - **prompt_audio**: 作为音色参考的音频文件 (WAV, MP3, etc.)。
+    - **retry_times**: 重试次数。如果大于0，将多次生成并选择MOS分数最高的音频。
+    """
+    prompt_audio_temp_path = None
+    to_be_clean_wav = None
+    output_temp_path = None
+    best_audio_path = None
+    try:
+        if not prompt_audio:
+            raise HTTPException(status_code=400, detail="Prompt audio file is required.")
+        text = "这是一段测试的音频，用作未来克隆使用"
+        retry_times = 0
+        desired_seconds = 0
+        logger.info(f"Processing REFERENCE TTS reference audio request: text='{text}', retry_times={retry_times}")
+        prompt_audio_temp_path = await save_audio_to_temp(prompt_audio)
+        to_be_clean_wav = prompt_audio_temp_path
+        prompt_seconds = get_wav_duration(prompt_audio_temp_path)
+        logger.info(f"generate reference audio, prompt_seconds: {prompt_seconds}, bytes len:{get_text_bytes_len(text)}")
+        max_mos = -1
+        best_audio_bytes = None
+        tasks = []
+        output_wavs = []
+        calc_mos = False
+        lang = 'zh'
+        if retry_times > 0:
+            calc_mos = True
+        for i in range(retry_times + 1):
+            output_temp_path = os.path.join(tempfile.gettempdir(), f"tts_output_{uuid.uuid4().hex}.wav")
+            tasks.append(synthesis_thread(
+                prompt_audio_temp_path, text, output_temp_path, desired_seconds, calc_mos, lang=lang
+            ))
+            output_wavs.append(output_temp_path)
+        results = await asyncio.gather(*tasks)
+        for i, result in enumerate(results):
+            cur_mos = result
+            if cur_mos is not None and cur_mos > max_mos:
+                max_mos = cur_mos
+                best_audio_path = output_wavs[i]
+        logger.info(f"pick best audio path:{best_audio_path} for text{text}, most:{max_mos}")
+        if best_audio_path is not None:
+            with open(best_audio_path, 'rb') as f:
+                best_audio_bytes = f.read()
+
+        if best_audio_bytes is None:
+            raise HTTPException(status_code=500, detail="TTS inference failed to generate any valid audio.")
+
+        return Response(content=best_audio_bytes, media_type="audio/wav")
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        tb_str = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+        logger.error(f"Error in generate_reference tts: {tb_str}")
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
+
+    finally:
+        await cleanup_resources([to_be_clean_wav, output_temp_path, best_audio_path])
+        if torch.cuda.is_available():
+            reserved = torch.cuda.memory_reserved() / 1024 ** 2
+            allocated = torch.cuda.memory_allocated() / 1024 ** 2
+            GPU_MEM_THRESHOLD_MB = 16000
+            if allocated > GPU_MEM_THRESHOLD_MB or reserved > GPU_MEM_THRESHOLD_MB:
+                logger.info(f"Freeing GPU memory, reserved:{reserved}, allocated:{allocated}")
+                torch.cuda.empty_cache()
+                reserved = torch.cuda.memory_reserved() / 1024 ** 2
+                allocated = torch.cuda.memory_allocated() / 1024 ** 2
+                logger.info(f"After freeing GPU memory, reserved:{reserved}, allocated:{allocated}")
+
 
 
 class TTSListRequest(BaseModel):

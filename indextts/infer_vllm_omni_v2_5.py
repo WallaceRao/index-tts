@@ -40,6 +40,7 @@ def resolve_omni_model_root(model_dir: str) -> str:
 def _default_deploy_config() -> str:
     candidates = [
         os.environ.get("INDEXTTS_VLLM_DEPLOY_CONFIG", ""),
+        "/home/ubuntu/raoyonghui/indextts_2.5/vllm-omni/vllm_omni/deploy/indextts2_5.yaml",
         "/tmp/vllm-omni/vllm_omni/deploy/indextts2_5.yaml",
         str(Path(__file__).resolve().parents[2] / "vllm_omni" / "deploy" / "indextts2_5.yaml"),
     ]
