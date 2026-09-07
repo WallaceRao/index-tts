@@ -397,7 +397,7 @@ async def generate_reference_audio(
     try:
         if not prompt_audio:
             raise HTTPException(status_code=400, detail="Prompt audio file is required.")
-        text = "这是一段测试的音频，用作未来克隆使用"
+        text = "这是一段人工指定用作未来克隆使用的参考音频."
         retry_times = 0
         desired_seconds = 0
         logger.info(f"Processing REFERENCE TTS reference audio request: text='{text}', retry_times={retry_times}")
